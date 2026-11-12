@@ -126,13 +126,110 @@ fn fail(events: &DriverEvents, failure: &LinuxUpdateFailure) {
     events.emit(DriverEvent::Settled);
 }
 
+/// Where a started driver is in its check/install lifecycle.
+///
+/// Only [`Phase::apply`] writes it. `gpui_updater` forwards every check and
+/// install click without a busy guard, so this is what stops a second
+/// `pkexec` install while one is running.
+#[derive(Debug, Clone)]
+enum Phase {
+    Idle,
+    /// Keeps the release a failed check falls back to.
+    Checking {
+        previous: Option<Release>,
+    },
+    Available(Release),
+    /// Keeps the release a failed install falls back to.
+    Installing(Release),
+}
+
+/// An event that moves [`Phase`].
+#[derive(Debug)]
+enum Step {
+    Check,
+    Checked(Option<Box<Release>>),
+    CheckFailed,
+    Install,
+    Installed,
+    InstallFailed,
+}
+
+/// Why [`Phase::apply`] rejected a step.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// A check or install is already running and will settle without help.
+    Busy,
+    NoRelease,
+    Poisoned,
+}
+
+impl Phase {
+    fn apply(&mut self, step: Step) -> Result<(), Refusal> {
+        let next = match (&*self, step) {
+            (Self::Idle, Step::Check) => Self::Checking { previous: None },
+            (Self::Available(release), Step::Check) => Self::Checking {
+                previous: Some(release.clone()),
+            },
+            (Self::Checking { .. }, Step::Checked(found)) => {
+                found.map_or(Self::Idle, |release| Self::Available(*release))
+            }
+            (Self::Checking { previous }, Step::CheckFailed) => {
+                previous.clone().map_or(Self::Idle, Self::Available)
+            }
+            (Self::Idle, Step::Install) => return Err(Refusal::NoRelease),
+            (Self::Available(release), Step::Install) => Self::Installing(release.clone()),
+            (Self::Installing(_), Step::Installed) => Self::Idle,
+            (Self::Installing(release), Step::InstallFailed) => Self::Available(release.clone()),
+            _ => return Err(Refusal::Busy),
+        };
+        *self = next;
+        Ok(())
+    }
+}
+
+/// The event sink and lifecycle phase, which `start` hands over together.
+struct Session {
+    events: DriverEvents,
+    phase: Arc<Mutex<Phase>>,
+}
+
+impl Session {
+    /// Apply `step`, reporting a refusal the user must see. Returns the new
+    /// phase on success.
+    fn begin(&self, step: Step) -> Option<Phase> {
+        let refusal = match self.phase.lock() {
+            Ok(mut phase) => match phase.apply(step) {
+                Ok(()) => return Some(phase.clone()),
+                Err(refusal) => refusal,
+            },
+            Err(_) => Refusal::Poisoned,
+        };
+        match refusal {
+            Refusal::Busy => {}
+            Refusal::NoRelease => fail(&self.events, &LinuxUpdateFailure::NoUpdateSelected),
+            Refusal::Poisoned => fail(&self.events, &LinuxUpdateFailure::StateUnavailable),
+        }
+        None
+    }
+}
+
+/// Apply a step that a worker thread reports when it finishes. Its own
+/// `Checking`/`Installing` phase stays in place until then, because `begin`
+/// refuses every other step while it runs.
+fn finish(phase: &Mutex<Phase>, step: Step) {
+    if let Ok(mut phase) = phase.lock() {
+        let applied = phase.apply(step);
+        debug_assert!(applied.is_ok(), "worker finished outside its phase");
+    }
+}
+
 /// Update driver for Linux installations managed by a package manager.
 pub(crate) struct LinuxPackageDriver {
     manifest_url: String,
     public_key: Option<String>,
     current_version: Version,
-    available: Arc<Mutex<Option<Release>>>,
-    events: Option<DriverEvents>,
+    /// `None` until [`UpdateDriver::start`].
+    session: Option<Session>,
 }
 
 impl LinuxPackageDriver {
@@ -145,113 +242,74 @@ impl LinuxPackageDriver {
             manifest_url,
             public_key,
             current_version,
-            available: Arc::new(Mutex::new(None)),
-            events: None,
+            session: None,
         }
     }
 }
 
 impl UpdateDriver for LinuxPackageDriver {
     fn start(&mut self, events: DriverEvents) {
-        self.events = Some(events);
+        self.session = Some(Session {
+            events,
+            phase: Arc::new(Mutex::new(Phase::Idle)),
+        });
     }
 
     fn check(&mut self) {
-        let Some(events) = self.events.clone() else {
+        let Some(session) = &self.session else {
             return;
         };
+        if session.begin(Step::Check).is_none() {
+            return;
+        }
 
+        let events = session.events.clone();
+        let phase = Arc::clone(&session.phase);
         let url = self.manifest_url.clone();
         let key = self.public_key.clone();
         let version = self.current_version.clone();
-        let available = Arc::clone(&self.available);
 
         events.emit(DriverEvent::Checking);
 
         std::thread::spawn(move || {
-            let installation = InstallationSource::detect();
-            let Some(format) = package_format(installation) else {
-                fail(&events, &LinuxUpdateFailure::UnsupportedInstallation);
-                return;
-            };
-
-            let Some(arch) = manifest_arch() else {
-                fail(&events, &LinuxUpdateFailure::UnsupportedArchitecture);
-                return;
-            };
-
-            let source = StaticManifestSource::new(url)
-                .os("linux")
-                .arch(arch)
-                .format(format);
-
-            let mut config = EngineConfig::new(version).verification(Verification::Strict);
-
-            if let Some(key) = key {
-                config = config.minisign_public_key(key);
-            }
-
-            let engine = UpdateEngine::new(source, config);
-
-            match engine.check() {
-                Ok(Some(release)) => {
-                    let Some(expected) = expected_package_name(installation, &release.version)
-                    else {
-                        fail(&events, &LinuxUpdateFailure::UnsupportedArchitecture);
-                        return;
-                    };
-
-                    if release.asset.name != expected {
-                        fail(&events, &LinuxUpdateFailure::PackageMismatch);
-                        return;
-                    }
-
-                    if let Ok(mut slot) = available.lock() {
-                        *slot = Some(release.clone());
-                    }
-                    events.emit(DriverEvent::Found(release));
+            match find_release(url, key, version) {
+                Ok(found) => {
+                    finish(&phase, Step::Checked(found.clone().map(Box::new)));
+                    events.emit(found.map_or(DriverEvent::UpToDate, DriverEvent::Found));
                 }
-                Ok(None) => {
-                    if let Ok(mut slot) = available.lock() {
-                        *slot = None;
-                    }
-                    events.emit(DriverEvent::UpToDate);
-                }
-                Err(error) => {
-                    events.emit(DriverEvent::Failed(error.to_string()));
+                Err(failure) => {
+                    finish(&phase, Step::CheckFailed);
+                    events.emit(DriverEvent::Failed(failure.message()));
                 }
             }
-
             events.emit(DriverEvent::Settled);
         });
     }
 
     fn install(&mut self) {
-        let Some(events) = self.events.clone() else {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let Some(Phase::Installing(release)) = session.begin(Step::Install) else {
             return;
         };
 
-        let release = if let Ok(available) = self.available.lock() {
-            available.clone()
-        } else {
-            fail(&events, &LinuxUpdateFailure::StateUnavailable);
-            return;
-        };
-
-        let Some(release) = release else {
-            fail(&events, &LinuxUpdateFailure::NoUpdateSelected);
-            return;
-        };
-
+        let events = session.events.clone();
+        let phase = Arc::clone(&session.phase);
         let url = self.manifest_url.clone();
         let key = self.public_key.clone();
         let version = self.current_version.clone();
 
         std::thread::spawn(move || {
-            let result = install_verified_package(release, url, key, version, &events);
-            match result {
-                Ok(version) => events.emit(DriverEvent::ReadyToRelaunch(version)),
-                Err(failure) => events.emit(DriverEvent::Failed(failure.message())),
+            match install_verified_package(release, url, key, version, &events) {
+                Ok(version) => {
+                    finish(&phase, Step::Installed);
+                    events.emit(DriverEvent::ReadyToRelaunch(version));
+                }
+                Err(failure) => {
+                    finish(&phase, Step::InstallFailed);
+                    events.emit(DriverEvent::Failed(failure.message()));
+                }
             }
             events.emit(DriverEvent::Settled);
         });
@@ -266,10 +324,48 @@ impl UpdateDriver for LinuxPackageDriver {
         // It avoids opening a second instance while the old one is running.
         let error = std::process::Command::new(executable).exec();
 
-        if let Some(events) = &self.events {
-            fail(events, &LinuxUpdateFailure::Relaunch(error.to_string()));
+        if let Some(session) = &self.session {
+            fail(
+                &session.events,
+                &LinuxUpdateFailure::Relaunch(error.to_string()),
+            );
         }
     }
+}
+
+/// Look up the newest release whose package matches this installation.
+fn find_release(
+    url: String,
+    key: Option<String>,
+    version: Version,
+) -> Result<Option<Release>, LinuxUpdateFailure> {
+    let installation = InstallationSource::detect();
+    let format = package_format(installation).ok_or(LinuxUpdateFailure::UnsupportedInstallation)?;
+    let arch = manifest_arch().ok_or(LinuxUpdateFailure::UnsupportedArchitecture)?;
+
+    let source = StaticManifestSource::new(url)
+        .os("linux")
+        .arch(arch)
+        .format(format);
+
+    let mut config = EngineConfig::new(version).verification(Verification::Strict);
+    if let Some(key) = key {
+        config = config.minisign_public_key(key);
+    }
+
+    let Some(release) = UpdateEngine::new(source, config)
+        .check()
+        .map_err(|error| LinuxUpdateFailure::Other(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+
+    let expected = expected_package_name(installation, &release.version)
+        .ok_or(LinuxUpdateFailure::UnsupportedArchitecture)?;
+    if release.asset.name != expected {
+        return Err(LinuxUpdateFailure::PackageMismatch);
+    }
+    Ok(Some(release))
 }
 
 /// Download, verify, and elevate-install one signed Linux package release.
@@ -492,6 +588,138 @@ mod tests {
     fn engine_failures_pass_through_unchanged() {
         let failure = LinuxUpdateFailure::Other("no release asset matched".to_owned());
         assert_eq!(failure.message(), "no release asset matched");
+    }
+
+    fn release() -> Release {
+        let version = Version::parse("0.9.1").unwrap();
+        Release::new(
+            version,
+            gpui_updater::Asset::new("openlogi-v0.9.1-linux-amd64.deb", "https://x", 0),
+        )
+    }
+
+    /// A started driver whose emitted events are recorded as their `Debug` form.
+    fn started(phase: Phase) -> (LinuxPackageDriver, Arc<Mutex<Vec<String>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let mut driver = LinuxPackageDriver::new(
+            "https://x".to_owned(),
+            None,
+            Version::parse("0.9.0").unwrap(),
+        );
+        driver.start(DriverEvents::new(move |event| {
+            sink.lock().unwrap().push(format!("{event:?}"));
+        }));
+        *driver.session.as_ref().unwrap().phase.lock().unwrap() = phase;
+        (driver, log)
+    }
+
+    #[test]
+    fn phase_transitions() {
+        use Refusal::{Busy, NoRelease};
+        let checking = || Phase::Checking { previous: None };
+        let cases: [(Phase, Step, Result<(), Refusal>, &str); 14] = [
+            (Phase::Idle, Step::Check, Ok(()), "Checking"),
+            (Phase::Available(release()), Step::Check, Ok(()), "Checking"),
+            (checking(), Step::Check, Err(Busy), "Checking"),
+            (
+                Phase::Installing(release()),
+                Step::Check,
+                Err(Busy),
+                "Installing",
+            ),
+            (
+                checking(),
+                Step::Checked(Some(Box::new(release()))),
+                Ok(()),
+                "Available",
+            ),
+            (checking(), Step::Checked(None), Ok(()), "Idle"),
+            (checking(), Step::CheckFailed, Ok(()), "Idle"),
+            (
+                Phase::Checking {
+                    previous: Some(release()),
+                },
+                Step::CheckFailed,
+                Ok(()),
+                "Available",
+            ),
+            (Phase::Idle, Step::Install, Err(NoRelease), "Idle"),
+            (checking(), Step::Install, Err(Busy), "Checking"),
+            (
+                Phase::Available(release()),
+                Step::Install,
+                Ok(()),
+                "Installing",
+            ),
+            (
+                Phase::Installing(release()),
+                Step::Install,
+                Err(Busy),
+                "Installing",
+            ),
+            (
+                Phase::Installing(release()),
+                Step::Installed,
+                Ok(()),
+                "Idle",
+            ),
+            (
+                Phase::Installing(release()),
+                Step::InstallFailed,
+                Ok(()),
+                "Available",
+            ),
+        ];
+        for (mut phase, step, verdict, after) in cases {
+            let label = format!("{phase:?} + {step:?}");
+            assert_eq!(phase.apply(step), verdict, "{label}");
+            assert!(
+                format!("{phase:?}").starts_with(after),
+                "{label} -> {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_before_start_does_nothing() {
+        let mut driver = LinuxPackageDriver::new(
+            "https://x".to_owned(),
+            None,
+            Version::parse("0.9.0").unwrap(),
+        );
+        driver.install();
+        assert!(driver.session.is_none());
+    }
+
+    #[test]
+    fn install_without_release_reports_no_update_selected() {
+        let _locale = crate::services::i18n::LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let (mut driver, log) = started(Phase::Idle);
+        driver.install();
+        let expected = format!(
+            "Failed({:?})",
+            LinuxUpdateFailure::NoUpdateSelected.message()
+        );
+        assert_eq!(*log.lock().unwrap(), [expected, "Settled".to_owned()]);
+    }
+
+    #[test]
+    fn second_install_and_check_while_installing_are_ignored() {
+        let (mut driver, log) = started(Phase::Installing(release()));
+        driver.install();
+        driver.check();
+        assert!(log.lock().unwrap().is_empty());
+        let phase = driver
+            .session
+            .as_ref()
+            .unwrap()
+            .phase
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(matches!(phase, Phase::Installing(_)), "{phase:?}");
     }
 
     #[test]
